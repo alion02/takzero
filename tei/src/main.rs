@@ -89,11 +89,11 @@ fn main() {
     });
     println!("{}", Output::Option {
         name: "HalfKomi",
-        value_type: ValueType::Combo,
+        value_type: ValueType::Spin,
         default: Some("4"),
-        min: None,
-        max: None,
-        variables: &["4"]
+        min: Some("4"),
+        max: Some("4"),
+        variables: &[]
     });
     println!("{}", Output::Option {
         name: "MultiPV",
