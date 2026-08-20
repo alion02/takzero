@@ -8,6 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "playtak-policy")]
+use clap::Parser;
+#[cfg(feature = "playtak-policy")]
+use rand::Rng;
 use fast_tak::takparse::{Color, Move};
 use protocol::{GoOption, Id, Input, Output, ParseInputError, Position, ValueType};
 use takzero::{
@@ -32,10 +36,32 @@ const DURATION_BEFORE_CHECKING_INPUT: Duration = Duration::from_secs(1);
 const BATCH_SIZE: usize = 128;
 const BETA: f32 = 0.0;
 
+#[cfg(feature = "playtak-policy")]
+#[derive(Debug, Parser)]
+struct PlaytakPolicyArgs {
+    /// Wait this many milliseconds before returning each move.
+    #[arg(long, alias = "move-time-ms", default_value_t = 0)]
+    fixed_move_time_ms: u64,
+    /// Probability mass to retain when sampling a move.
+    #[arg(long, default_value_t = 1.0)]
+    top_p: f32,
+    /// Temperature used when sampling a move.
+    #[arg(long, default_value_t = 1.0)]
+    temperature: f32,
+    /// Linear top-p decrease per played ply.
+    #[arg(long, default_value_t = 0.0)]
+    top_p_decay_per_ply: f32,
+    /// Linear temperature decrease per played ply.
+    #[arg(long, default_value_t = 0.0)]
+    temperature_decay_per_ply: f32,
+}
+
 #[allow(clippy::too_many_lines)] // FIXME
 #[allow(clippy::cognitive_complexity)] // FIXME
 fn main() {
     env_logger::init();
+    #[cfg(feature = "playtak-policy")]
+    let playtak_policy_args = PlaytakPolicyArgs::parse();
     let mut line = String::new();
     let stdin = std::io::stdin();
 
@@ -74,21 +100,23 @@ fn main() {
         max: Some("2048"),
         variables: &[]
     });
-    println!("{}", Output::Option {
-        name: "PolicyOnly",
-        value_type: ValueType::Check,
-        default: Some("false"),
-        min: None,
-        max: None,
-        variables: &[]
-    });
+    if !cfg!(feature = "playtak-policy") {
+        println!("{}", Output::Option {
+            name: "PolicyOnly",
+            value_type: ValueType::Check,
+            default: Some("false"),
+            min: None,
+            max: None,
+            variables: &[]
+        });
+    }
 
     println!("{}", Output::Ok);
 
     // Configure engine options.
     let mut model_path = None;
     let mut num_multi_pv = 5;
-    let mut policy_only = false;
+    let mut policy_only = cfg!(feature = "playtak-policy");
     loop {
         match get_input(&stdin, &mut line) {
             Ok(Input::IsReady) => break,
@@ -114,6 +142,7 @@ fn main() {
                     };
                     num_multi_pv = x;
                 }
+                #[cfg(not(feature = "playtak-policy"))]
                 "PolicyOnly" => {
                     let Ok(x) = value.parse::<bool>() else {
                         log::error!("could not parse policy only");
@@ -283,7 +312,12 @@ fn main() {
                         )
                         .next()
                         .expect("agent should return exactly one prediction");
-                    // Normalize like in standard MCTS.
+                    #[cfg(feature = "playtak-policy")]
+                    let raw_policy: Vec<(Move, f32)> = policy
+                        .iter()
+                        .map(|(mv, value)| (*mv, (*value).into_inner()))
+                        .collect();
+                    // Normalize the raw network policy for display and ranking.
                     let probabilities = softmax(policy.clone().into_iter().map(|(_, p)| p));
                     let mut moves: Vec<(Move, i32)> = policy
                         .into_iter()
@@ -311,7 +345,23 @@ fn main() {
                                 cp: Some(*policy_value),
                             });
                         }
-                        println!("{}", Output::BestMove(moves[0].0));
+                        #[cfg(feature = "playtak-policy")]
+                        let best_move = sample_policy_move(
+                            &raw_policy,
+                            &playtak_policy_args,
+                            last_moves.len(),
+                        );
+                        #[cfg(not(feature = "playtak-policy"))]
+                        let best_move = moves[0].0;
+
+                        #[cfg(feature = "playtak-policy")]
+                        if let Some(remaining) =
+                            Duration::from_millis(playtak_policy_args.fixed_move_time_ms)
+                                .checked_sub(start.elapsed())
+                        {
+                            std::thread::sleep(remaining);
+                        }
+                        println!("{}", Output::BestMove(best_move));
                     }
                     go_status = GoStatus::Stopped;
                 } else {
@@ -410,6 +460,52 @@ enum GoStatus {
     Starting,
     Going,
     Stopping,
+}
+
+#[cfg(feature = "playtak-policy")]
+fn sample_policy_move(
+    policy: &[(Move, f32)],
+    args: &PlaytakPolicyArgs,
+    ply: usize,
+) -> Move {
+    let ply = ply as f32;
+    let temperature = (args.temperature - args.temperature_decay_per_ply * ply)
+        .max(f32::EPSILON);
+    let top_p = (args.top_p - args.top_p_decay_per_ply * ply)
+        .clamp(f32::EPSILON, 1.0);
+
+    let max = policy
+        .iter()
+        .map(|(_, logit)| *logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probabilities: Vec<(Move, f32)> = policy
+        .iter()
+        .map(|(mv, logit)| (*mv, ((*logit - max) / temperature).exp()))
+        .collect();
+    let sum: f32 = probabilities.iter().map(|(_, probability)| *probability).sum();
+    probabilities.iter_mut().for_each(|(_, probability)| *probability /= sum);
+    probabilities.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
+
+    let mut retained = Vec::new();
+    let mut cumulative = 0.0;
+    for (mv, probability) in probabilities {
+        retained.push((mv, probability));
+        cumulative += probability;
+        if cumulative >= top_p {
+            break;
+        }
+    }
+
+    let retained_mass: f32 = retained.iter().map(|(_, probability)| *probability).sum();
+    let sample = rand::rng().random_range(0.0..retained_mass);
+    let mut cumulative = 0.0;
+    retained
+        .into_iter()
+        .find(|(_, probability)| {
+            cumulative += *probability;
+            sample < cumulative
+        })
+        .map_or_else(|| policy[0].0, |(mv, _)| mv)
 }
 
 #[derive(Debug, Error)]
