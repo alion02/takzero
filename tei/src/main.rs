@@ -10,10 +10,10 @@ use std::{
 
 #[cfg(feature = "playtak-policy")]
 use clap::Parser;
-#[cfg(feature = "playtak-policy")]
-use rand::Rng;
 use fast_tak::takparse::{Color, Move};
 use protocol::{GoOption, Id, Input, Output, ParseInputError, Position, ValueType};
+#[cfg(feature = "playtak-policy")]
+use rand::Rng;
 use takzero::{
     network::{
         net6_simhash::{Env, Net, HALF_KOMI, N},
@@ -54,6 +54,9 @@ struct PlaytakPolicyArgs {
     /// Linear temperature decrease per played ply.
     #[arg(long, default_value_t = 0.0)]
     temperature_decay_per_ply: f32,
+    /// Model path.
+    #[arg(long)]
+    model: String,
 }
 
 #[allow(clippy::too_many_lines)] // FIXME
@@ -76,6 +79,7 @@ fn main() {
     println!("{}", Output::Id(Id::Author("Viliam Vadocz (0x57696c6c)")));
 
     // Describe engine options.
+    #[cfg(not(feature = "playtak-policy"))]
     println!("{}", Output::Option {
         name: "model",
         value_type: ValueType::String,
@@ -100,21 +104,21 @@ fn main() {
         max: Some("2048"),
         variables: &[]
     });
-    if !cfg!(feature = "playtak-policy") {
-        println!("{}", Output::Option {
-            name: "PolicyOnly",
-            value_type: ValueType::Check,
-            default: Some("false"),
-            min: None,
-            max: None,
-            variables: &[]
-        });
-    }
+    #[cfg(not(feature = "playtak-policy"))]
+    println!("{}", Output::Option {
+        name: "PolicyOnly",
+        value_type: ValueType::Check,
+        default: Some("false"),
+        min: None,
+        max: None,
+        variables: &[]
+    });
 
     println!("{}", Output::Ok);
 
     // Configure engine options.
-    let mut model_path = None;
+    let mut model_path =
+        cfg!(feature = "playtak-policy").then_some(playtak_policy_args.model.clone());
     let mut num_multi_pv = 5;
     let mut policy_only = cfg!(feature = "playtak-policy");
     loop {
@@ -305,7 +309,7 @@ fn main() {
                     let start = Instant::now();
                     let mut actions = Vec::new();
                     env.populate_actions(&mut actions);
-                    let (policy, _, _) = net
+                    let (policy, ..) = net
                         .policy_value_uncertainty(
                             std::slice::from_ref(&env),
                             std::slice::from_ref(&actions),
@@ -346,11 +350,8 @@ fn main() {
                             });
                         }
                         #[cfg(feature = "playtak-policy")]
-                        let best_move = sample_policy_move(
-                            &raw_policy,
-                            &playtak_policy_args,
-                            last_moves.len(),
-                        );
+                        let best_move =
+                            sample_policy_move(&raw_policy, &playtak_policy_args, last_moves.len());
                         #[cfg(not(feature = "playtak-policy"))]
                         let best_move = moves[0].0;
 
@@ -463,16 +464,10 @@ enum GoStatus {
 }
 
 #[cfg(feature = "playtak-policy")]
-fn sample_policy_move(
-    policy: &[(Move, f32)],
-    args: &PlaytakPolicyArgs,
-    ply: usize,
-) -> Move {
+fn sample_policy_move(policy: &[(Move, f32)], args: &PlaytakPolicyArgs, ply: usize) -> Move {
     let ply = ply as f32;
-    let temperature = (args.temperature - args.temperature_decay_per_ply * ply)
-        .max(f32::EPSILON);
-    let top_p = (args.top_p - args.top_p_decay_per_ply * ply)
-        .clamp(f32::EPSILON, 1.0);
+    let temperature = (args.temperature - args.temperature_decay_per_ply * ply).max(f32::EPSILON);
+    let top_p = (args.top_p - args.top_p_decay_per_ply * ply).clamp(f32::EPSILON, 1.0);
 
     let max = policy
         .iter()
@@ -482,8 +477,13 @@ fn sample_policy_move(
         .iter()
         .map(|(mv, logit)| (*mv, ((*logit - max) / temperature).exp()))
         .collect();
-    let sum: f32 = probabilities.iter().map(|(_, probability)| *probability).sum();
-    probabilities.iter_mut().for_each(|(_, probability)| *probability /= sum);
+    let sum: f32 = probabilities
+        .iter()
+        .map(|(_, probability)| *probability)
+        .sum();
+    probabilities
+        .iter_mut()
+        .for_each(|(_, probability)| *probability /= sum);
     probabilities.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
 
     let mut retained = Vec::new();
