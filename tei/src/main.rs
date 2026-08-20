@@ -56,7 +56,7 @@ struct PlaytakPolicyArgs {
     temperature_decay_per_ply: f32,
     /// Model path.
     #[arg(long)]
-    model: String,
+    model: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)] // FIXME
@@ -79,7 +79,6 @@ fn main() {
     println!("{}", Output::Id(Id::Author("Viliam Vadocz (0x57696c6c)")));
 
     // Describe engine options.
-    #[cfg(not(feature = "playtak-policy"))]
     println!("{}", Output::Option {
         name: "model",
         value_type: ValueType::String,
@@ -117,8 +116,10 @@ fn main() {
     println!("{}", Output::Ok);
 
     // Configure engine options.
-    let mut model_path =
-        cfg!(feature = "playtak-policy").then_some(playtak_policy_args.model.clone());
+    #[cfg(feature = "playtak-policy")]
+    let mut model_path = playtak_policy_args.model.clone();
+    #[cfg(not(feature = "playtak-policy"))]
+    let mut model_path = None;
     let mut num_multi_pv = 5;
     let mut policy_only = cfg!(feature = "playtak-policy");
     loop {
