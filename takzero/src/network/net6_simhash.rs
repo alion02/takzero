@@ -32,7 +32,8 @@ pub const MAXIMUM_VARIANCE: f64 = 4.0;
 #[derive(Debug)]
 pub struct Net {
     vs: nn::VarStore,
-    core: nn::SequentialT,
+    core_input: nn::SequentialT,
+    core_blocks: Vec<ResidualBlock>,
     policy_net: nn::SequentialT,
     value_net: nn::SequentialT,
     ube_net: nn::SequentialT,
@@ -40,9 +41,12 @@ pub struct Net {
     simhash_set: BitBox,
 }
 
-fn core(path: &nn::Path) -> nn::SequentialT {
-    const CORE_RES_BLOCKS: u32 = 16;
-    let mut core = nn::seq_t()
+/// Number of residual blocks in the core.
+pub const CORE_RES_BLOCKS: usize = 16;
+
+/// Build the input layers of the core and the residual blocks.
+fn core(path: &nn::Path) -> (nn::SequentialT, Vec<ResidualBlock>) {
+    let core_input = nn::seq_t()
         .add(nn::conv2d(
             path / "input_conv2d",
             input_channels::<N>() as i64,
@@ -61,14 +65,10 @@ fn core(path: &nn::Path) -> nn::SequentialT {
             nn::BatchNormConfig::default(),
         ))
         .add_fn(Tensor::relu);
-    for n in 0..CORE_RES_BLOCKS {
-        core = core.add(ResidualBlock::new(
-            &(path / format!("res_block_{n}")),
-            FILTERS,
-            FILTERS,
-        ));
-    }
-    core
+    let core_blocks = (0..CORE_RES_BLOCKS)
+        .map(|n| ResidualBlock::new(&(path / format!("res_block_{n}")), FILTERS, FILTERS))
+        .collect();
+    (core_input, core_blocks)
 }
 
 fn policy_net(path: &nn::Path) -> nn::SequentialT {
@@ -126,8 +126,10 @@ impl Network for Net {
 
         let vs = nn::VarStore::new(device);
         let root = vs.root();
+        let (core_input, core_blocks) = core(&(&root / "core"));
         Self {
-            core: core(&(&root / "core")),
+            core_input,
+            core_blocks,
             policy_net: policy_net(&(&root / "policy")),
             value_net: value_net(&(&root / "value")),
             ube_net: ube_net(&(&root / "ube")),
@@ -190,9 +192,35 @@ impl Network for Net {
     }
 }
 
+impl Net {
+    /// Forward pass used for fine-tuning: the input layers and the first
+    /// `frozen_blocks` residual blocks run in eval mode without gradient tracking,
+    /// and the remaining blocks plus the policy head run in `train` mode.
+    /// Returns the policy logits.
+    ///
+    /// This allows fine-tuning only the late layers of the network, which saves
+    /// memory and gradient computations (and thus allows larger batch sizes).
+    pub fn forward_policy_finetune(&self, xs: &Tensor, train: bool, frozen_blocks: usize) -> Tensor {
+        let mut core = tch::no_grad(|| {
+            let mut core = self.core_input.forward_t(xs, false);
+            for block in self.core_blocks.iter().take(frozen_blocks) {
+                core = block.forward_t(&core, false);
+            }
+            core
+        });
+        for block in self.core_blocks.iter().skip(frozen_blocks) {
+            core = block.forward_t(&core, train);
+        }
+        self.policy_net.forward_t(&core, train)
+    }
+}
+
 impl HashNetwork<Env> for Net {
     fn forward_t(&self, xs: &Tensor, train: bool) -> (Tensor, Tensor, Tensor) {
-        let core = self.core.forward_t(xs, train);
+        let mut core = self.core_input.forward_t(xs, train);
+        for block in &self.core_blocks {
+            core = block.forward_t(&core, train);
+        }
         let policy = self.policy_net.forward_t(&core, train);
         let value = self.value_net.forward_t(&core, train);
         // Detached UBE so it does not mess with baseline

@@ -15,7 +15,12 @@ use takzero::{
         net6_simhash::{Env, Net, HALF_KOMI, N},
         Network,
     },
-    search::node::Node,
+    search::{
+        agent::Agent,
+        env::Environment,
+        eval::Eval,
+        node::{policy::softmax, Node},
+    },
 };
 use thiserror::Error;
 
@@ -69,12 +74,21 @@ fn main() {
         max: Some("2048"),
         variables: &[]
     });
+    println!("{}", Output::Option {
+        name: "PolicyOnly",
+        value_type: ValueType::Check,
+        default: Some("false"),
+        min: None,
+        max: None,
+        variables: &[]
+    });
 
     println!("{}", Output::Ok);
 
     // Configure engine options.
     let mut model_path = None;
     let mut num_multi_pv = 5;
+    let mut policy_only = false;
     loop {
         match get_input(&stdin, &mut line) {
             Ok(Input::IsReady) => break,
@@ -99,6 +113,13 @@ fn main() {
                         return;
                     };
                     num_multi_pv = x;
+                }
+                "PolicyOnly" => {
+                    let Ok(x) = value.parse::<bool>() else {
+                        log::error!("could not parse policy only");
+                        return;
+                    };
+                    policy_only = x;
                 }
                 _ => log::warn!("unknown option: {name}"),
             },
@@ -181,6 +202,7 @@ fn main() {
             score: node.evaluation,
             principal_variation: node.principal_variation().collect(),
             multi_pv: None,
+            cp: None,
         });
         for (multi_pv, (action, child)) in node.children.iter().rev().take(num_multi_pv).enumerate()
         {
@@ -193,6 +215,7 @@ fn main() {
                     .chain(child.principal_variation())
                     .collect(),
                 multi_pv: Some(NonZeroUsize::new(1 + multi_pv).unwrap()),
+                cp: None,
             });
         }
     };
@@ -246,9 +269,56 @@ fn main() {
                 go_status = GoStatus::Stopping;
             }
             Ok(Input::Go(options)) => {
-                go_options.clear();
-                go_options.extend(options);
-                go_status = GoStatus::Starting;
+                if policy_only {
+                    // Time controls in `go` are disregarded in policy-only mode.
+                    // Run the policy network once on the current position and
+                    // report the top moves sorted by policy score.
+                    let start = Instant::now();
+                    let mut actions = Vec::new();
+                    env.populate_actions(&mut actions);
+                    let (policy, _, _) = net
+                        .policy_value_uncertainty(
+                            std::slice::from_ref(&env),
+                            std::slice::from_ref(&actions),
+                        )
+                        .next()
+                        .expect("agent should return exactly one prediction");
+                    // Normalize like in standard MCTS.
+                    let probabilities = softmax(policy.clone().into_iter().map(|(_, p)| p));
+                    let mut moves: Vec<(Move, i32)> = policy
+                        .into_iter()
+                        .zip(probabilities)
+                        // cp is repurposed to carry the normalized policy
+                        // value, in per-mille.
+                        .map(|((mv, _), p)| (mv, (p.into_inner() * 1000.0).round() as i32))
+                        .collect();
+                    // Sort by policy score, highest first.
+                    moves.sort_by(|(_, a), (_, b)| b.cmp(a));
+                    let elapsed = start.elapsed();
+                    if moves.is_empty() {
+                        log::error!("no legal moves in policy-only mode");
+                    } else {
+                        for (multi_pv, (mv, policy_value)) in
+                            moves.iter().take(num_multi_pv).enumerate()
+                        {
+                            println!("{}", Output::Info {
+                                time: elapsed,
+                                nodes_since_start: 1,
+                                nodes: 1,
+                                score: Eval::default(),
+                                principal_variation: vec![*mv],
+                                multi_pv: Some(NonZeroUsize::new(1 + multi_pv).unwrap()),
+                                cp: Some(*policy_value),
+                            });
+                        }
+                        println!("{}", Output::BestMove(moves[0].0));
+                    }
+                    go_status = GoStatus::Stopped;
+                } else {
+                    go_options.clear();
+                    go_options.extend(options);
+                    go_status = GoStatus::Starting;
+                }
             }
             Ok(Input::Option { .. }) => log::warn!("it's too late to specify options"),
             Ok(Input::Tei) => log::warn!("tei does not make sense here"),

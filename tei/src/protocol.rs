@@ -184,6 +184,10 @@ pub enum Output {
         score: Eval,
         principal_variation: Vec<Move>,
         multi_pv: Option<NonZeroUsize>,
+        /// When set, `score cp` is taken from this value directly and the
+        /// wdl/mate output is suppressed. Used by policy-only mode, where cp
+        /// carries the normalized policy value (in per-mille).
+        cp: Option<i32>,
     },
 }
 
@@ -251,27 +255,34 @@ impl fmt::Display for Output {
                 score,
                 principal_variation,
                 multi_pv,
+                cp,
             } => {
-                let centipawns = (f32::from(*score) * 100.0).round() as i32;
+                let centipawns = cp.as_ref().map_or_else(
+                    || (f32::from(*score) * 100.0).round() as i32,
+                    |cp| *cp,
+                );
                 write!(f, "info time {} nodes {nodes}", time.as_millis())?;
                 if multi_pv.is_none() {
                     let nps = 1000 * nodes_since_start / time.as_millis() as usize;
                     write!(f, " nps {nps}")?;
                 }
-                match score {
-                    Eval::Win(_) => write!(f, " wdl 1000 0 0")?,
-                    Eval::Loss(_) => write!(f, " wdl 0 0 1000")?,
-                    Eval::Draw(_) => write!(f, " wdl 0 1000 0")?,
-                    Eval::Value(_) => {
-                        let score_per_mille = 500 + (f32::from(*score) * 500.0).round() as i32;
-                        write!(f, " wdl {} 0 {}", score_per_mille, 1000 - score_per_mille)?;
+                // Policy-only mode repurposes cp, so the wdl/mate output is omitted.
+                if cp.is_none() {
+                    match score {
+                        Eval::Win(_) => write!(f, " wdl 1000 0 0")?,
+                        Eval::Loss(_) => write!(f, " wdl 0 0 1000")?,
+                        Eval::Draw(_) => write!(f, " wdl 0 1000 0")?,
+                        Eval::Value(_) => {
+                            let score_per_mille = 500 + (f32::from(*score) * 500.0).round() as i32;
+                            write!(f, " wdl {} 0 {}", score_per_mille, 1000 - score_per_mille)?;
+                        }
                     }
-                }
-                match score {
-                    Eval::Win(ply) => write!(f, " score mate {}", ply.div_ceil(2))?,
-                    Eval::Loss(ply) => write!(f, " score mate -{}", ply.div_ceil(2))?,
-                    // Eval::Draw(ply) => write!(f, "score mate {}", ply.div_ceil(2))?,
-                    _ => {}
+                    match score {
+                        Eval::Win(ply) => write!(f, " score mate {}", ply.div_ceil(2))?,
+                        Eval::Loss(ply) => write!(f, " score mate -{}", ply.div_ceil(2))?,
+                        // Eval::Draw(ply) => write!(f, "score mate {}", ply.div_ceil(2))?,
+                        _ => {}
+                    }
                 }
                 write!(f, " score cp {centipawns}")?;
                 if let Some(n) = multi_pv {

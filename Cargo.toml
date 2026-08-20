@@ -7,6 +7,7 @@ members = [
     "analysis",
     "selfplay",
     "learn",
+    "finetune",
     "reanalyze",
     "tei",
     "eee",
