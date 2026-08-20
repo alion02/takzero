@@ -323,8 +323,8 @@ fn main() {
                         .into_iter()
                         .zip(probabilities)
                         // cp is repurposed to carry the normalized policy
-                        // value, in per-mille.
-                        .map(|((mv, _), p)| (mv, (p.into_inner() * 1000.0).round() as i32))
+                        // value scaled 0-100.
+                        .map(|((mv, _), p)| (mv, (p.into_inner() * 100.0).round() as i32))
                         .collect();
                     // Sort by policy score, highest first.
                     moves.sort_by(|(_, a), (_, b)| b.cmp(a));
