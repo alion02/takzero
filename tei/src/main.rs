@@ -122,6 +122,7 @@ fn main() {
     let mut model_path = None;
     let mut num_multi_pv = 5;
     let mut policy_only = cfg!(feature = "playtak-policy");
+    let mut leftover_msg = None;
     loop {
         match get_input(&stdin, &mut line) {
             Ok(Input::IsReady) => break,
@@ -157,7 +158,11 @@ fn main() {
                 }
                 _ => log::warn!("unknown option: {name}"),
             },
-            Ok(_) => log::warn!("only expecting `isready` or `option` messages"),
+            Ok(msg) => {
+                log::warn!("unexpected message, forcing switch to ready mode");
+                leftover_msg = Some(msg);
+                break;
+            }
             Err(err) => log::error!("{err}"),
         }
     }
@@ -189,7 +194,12 @@ fn main() {
         let should_stop = should_stop_2;
         let mut errors_in_a_row = 0;
         while !should_stop.load(Ordering::Relaxed) {
-            match get_input(&stdin, &mut line) {
+            let input = if let Some(msg) = leftover_msg.take() {
+                Ok(msg)
+            } else {
+                get_input(&stdin, &mut line)
+            };
+            match input {
                 Ok(x) => tx.send(x).expect("Main thread should still be alive."),
                 Err(err) => {
                     log::error!("{err}");
